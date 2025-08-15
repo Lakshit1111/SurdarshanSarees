@@ -33,7 +33,10 @@ export async function setupVite(app: Express, server: Server) {
       ...viteLogger,
       error: (msg, options) => {
         viteLogger.error(msg, options);
-        process.exit(1);
+        // Don't exit in production
+        if (process.env.NODE_ENV !== 'production') {
+          process.exit(1);
+        }
       },
     },
     server: serverOptions,
@@ -41,8 +44,14 @@ export async function setupVite(app: Express, server: Server) {
   });
 
   app.use(vite.middlewares);
+  
   app.use("*", async (req, res, next) => {
     const url = req.originalUrl;
+
+    // Skip API routes
+    if (url.startsWith('/api')) {
+      return next();
+    }
 
     try {
       const clientTemplate = path.resolve(
@@ -52,34 +61,104 @@ export async function setupVite(app: Express, server: Server) {
         "index.html",
       );
 
-      // always reload the index.html file from disk incase it changes
+      // Check if template exists
+      if (!fs.existsSync(clientTemplate)) {
+        log(`Template not found: ${clientTemplate}`, "vite");
+        return next();
+      }
+
       let template = await fs.promises.readFile(clientTemplate, "utf-8");
       template = template.replace(
         `src="/src/main.tsx"`,
         `src="/src/main.tsx?v=${nanoid()}"`,
       );
+      
       const page = await vite.transformIndexHtml(url, template);
       res.status(200).set({ "Content-Type": "text/html" }).end(page);
     } catch (e) {
       vite.ssrFixStacktrace(e as Error);
+      log(`Vite error: ${(e as Error).message}`, "vite");
       next(e);
     }
   });
 }
 
 export function serveStatic(app: Express) {
-  const distPath = path.resolve(import.meta.dirname, "public");
+  // Fix: Use 'dist' instead of 'public'
+  const distPath = path.resolve(import.meta.dirname, "..", "dist");
+  
+  log(`Serving static files from: ${distPath}`, "static");
 
   if (!fs.existsSync(distPath)) {
-    throw new Error(
-      `Could not find the build directory: ${distPath}, make sure to build the client first`,
-    );
+    log(`Build directory not found: ${distPath}`, "static");
+    
+    // For Vercel, try alternative paths
+    const alternativePaths = [
+      path.resolve("dist"),
+      path.resolve("./dist"),
+      path.resolve(process.cwd(), "dist")
+    ];
+    
+    let foundPath = null;
+    for (const altPath of alternativePaths) {
+      if (fs.existsSync(altPath)) {
+        foundPath = altPath;
+        break;
+      }
+    }
+    
+    if (foundPath) {
+      log(`Using alternative path: ${foundPath}`, "static");
+      app.use(express.static(foundPath));
+      
+      app.use("*", (req, res, next) => {
+        // Skip API routes
+        if (req.path.startsWith('/api')) {
+          return next();
+        }
+        
+        const indexPath = path.resolve(foundPath, "index.html");
+        if (fs.existsSync(indexPath)) {
+          res.sendFile(indexPath);
+        } else {
+          res.status(404).json({ message: "Frontend not found" });
+        }
+      });
+      return;
+    }
+    
+    // Fallback: serve a basic message
+    app.use("*", (req, res, next) => {
+      if (req.path.startsWith('/api')) {
+        return next();
+      }
+      
+      res.status(200).json({ 
+        message: "SurdarshanSarees API is running",
+        note: "Frontend build not found. Build the client first with 'npm run build'",
+        api: "Available at /api/*"
+      });
+    });
+    return;
   }
 
+  // Serve static files
   app.use(express.static(distPath));
 
-  // fall through to index.html if the file doesn't exist
-  app.use("*", (_req, res) => {
-    res.sendFile(path.resolve(distPath, "index.html"));
+  // SPA fallback - serve index.html for non-API routes
+  app.use("*", (req, res, next) => {
+    // Skip API routes
+    if (req.path.startsWith('/api')) {
+      return next();
+    }
+    
+    const indexPath = path.resolve(distPath, "index.html");
+    
+    if (fs.existsSync(indexPath)) {
+      res.sendFile(indexPath);
+    } else {
+      log(`index.html not found at: ${indexPath}`, "static");
+      res.status(404).json({ message: "Frontend not available" });
+    }
   });
 }
